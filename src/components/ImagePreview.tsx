@@ -30,6 +30,7 @@ interface ImagePreviewProps {
   onRecalibrate?:      () => void;
   onUndoLastPoint?:    () => void;
   onClearAllPoints?:   () => void;
+  onRemovePoint?:      (mode: ActivePickMode, index: number) => void;
   autoRunLabel?:       string;
 }
 
@@ -79,15 +80,22 @@ const DOT_STYLES: Record<string, { bg: string; ring: string; text: string; label
 };
 
 const RefDot = memo(function RefDot({
-  point, index, variant,
-}: { point: Point; index: number; variant: "n" | "p" | "k" | "filler" }) {
+  point, index, variant, showDelete, onDelete,
+}: {
+  point: Point;
+  index: number;
+  variant: "n" | "p" | "k" | "filler";
+  showDelete: boolean;
+  onDelete: () => void;
+}) {
   const style = DOT_STYLES[variant] ?? DOT_STYLES.n;
   return (
     <div
       style={{ left: `${point.x * 100}%`, top: `${point.y * 100}%` }}
       className={[
-        "absolute -translate-x-1/2 -translate-y-1/2",
-        "w-5 h-5 rounded-full border-2 border-white shadow-lg ring-2 pointer-events-none z-10",
+        "absolute -translate-x-1/2 -translate-y-1/2 z-10",
+        "w-5 h-5 rounded-full border-2 border-white shadow-lg ring-2",
+        showDelete ? "pointer-events-auto" : "pointer-events-none",
         style.bg, style.ring,
       ].join(" ")}
       title={`${style.label} ref ${index + 1}`}
@@ -95,6 +103,16 @@ const RefDot = memo(function RefDot({
       <span className={["absolute inset-0 flex items-center justify-center text-[7px] font-black", style.text].join(" ")}>
         {style.label}
       </span>
+      {showDelete && (
+        <button
+          onClick={e => { e.stopPropagation(); onDelete(); }}
+          style={{ top: -5, right: -5 }}
+          className="absolute w-3.5 h-3.5 rounded-full bg-white border border-slate-400 flex items-center justify-center text-[8px] font-black text-slate-600 leading-none cursor-pointer hover:bg-red-100 hover:border-red-400 hover:text-red-600 shadow"
+          title="Remove point"
+        >
+          ×
+        </button>
+      )}
     </div>
   );
 });
@@ -121,6 +139,7 @@ export default function ImagePreview({
   onRecalibrate,
   onUndoLastPoint,
   onClearAllPoints,
+  onRemovePoint,
   autoRunLabel,
 }: ImagePreviewProps) {
   const isCalibrating  = calibrationStep === "calibrating";
@@ -254,22 +273,26 @@ export default function ImagePreview({
 
             {/* N reference dots */}
             {refNPoints.map((pt, i) => (
-              <RefDot key={`n-${i}`} point={pt} index={i} variant="n" />
+              <RefDot key={`n-${i}`} point={pt} index={i} variant="n"
+                showDelete={isCalibrating} onDelete={() => onRemovePoint?.("n", i)} />
             ))}
 
             {/* P reference dots */}
             {refPPoints.map((pt, i) => (
-              <RefDot key={`p-${i}`} point={pt} index={i} variant="p" />
+              <RefDot key={`p-${i}`} point={pt} index={i} variant="p"
+                showDelete={isCalibrating} onDelete={() => onRemovePoint?.("p", i)} />
             ))}
 
             {/* K reference dots */}
             {refKPoints.map((pt, i) => (
-              <RefDot key={`k-${i}`} point={pt} index={i} variant="k" />
+              <RefDot key={`k-${i}`} point={pt} index={i} variant="k"
+                showDelete={isCalibrating} onDelete={() => onRemovePoint?.("k", i)} />
             ))}
 
             {/* Filler reference dots */}
             {refFillerPoints.map((pt, i) => (
-              <RefDot key={`f-${i}`} point={pt} index={i} variant="filler" />
+              <RefDot key={`f-${i}`} point={pt} index={i} variant="filler"
+                showDelete={isCalibrating} onDelete={() => onRemovePoint?.("filler", i)} />
             ))}
           </div>
         ) : (
