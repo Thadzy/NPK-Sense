@@ -37,6 +37,72 @@ interface ScanResult {
   previewImage: string;
 }
 
+// ─── Client-side perspective crop ────────────────────────────────────────────
+/**
+ * Replicates the backend's four_point_transform in the browser using canvas.
+ * Splits the quad into two triangles, each rendered with an affine warp.
+ * Eliminates the crop_only backend round-trip — user sees calibration image instantly.
+ */
+async function applyClientCrop(dataUrl: string, normPoints: Point[]): Promise<string> {
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => {
+      const W = img.naturalWidth, H = img.naturalHeight;
+      const src = normPoints.map(p => [p.x * W, p.y * H] as [number, number]);
+      const [tl, tr, br, bl] = src;
+      const dstW = Math.round(Math.max(
+        Math.hypot(tr[0] - tl[0], tr[1] - tl[1]),
+        Math.hypot(br[0] - bl[0], br[1] - bl[1]),
+      ));
+      const dstH = Math.round(Math.max(
+        Math.hypot(bl[0] - tl[0], bl[1] - tl[1]),
+        Math.hypot(br[0] - tr[0], br[1] - tr[1]),
+      ));
+      const canvas = document.createElement('canvas');
+      canvas.width = dstW; canvas.height = dstH;
+      const ctx = canvas.getContext('2d')!;
+
+      // Affine-warp one triangle: destination (d0,d1,d2) → source (s0,s1,s2)
+      const warpTri = (
+        [dx0,dy0]: [number,number], [dx1,dy1]: [number,number], [dx2,dy2]: [number,number],
+        [sx0,sy0]: [number,number], [sx1,sy1]: [number,number], [sx2,sy2]: [number,number],
+      ) => {
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(dx0,dy0); ctx.lineTo(dx1,dy1); ctx.lineTo(dx2,dy2);
+        ctx.closePath(); ctx.clip();
+        const d  = (dx0-dx2)*(dy1-dy2) - (dx1-dx2)*(dy0-dy2);
+        const a  = ((sx0-sx2)*(dy1-dy2) - (sx1-sx2)*(dy0-dy2)) / d;
+        const b  = ((sx1-sx2)*(dx0-dx2) - (sx0-sx2)*(dx1-dx2)) / d;
+        const c  = sx2 - a*dx2 - b*dy2;
+        const e  = ((sy0-sy2)*(dy1-dy2) - (sy1-sy2)*(dy0-dy2)) / d;
+        const f  = ((sy1-sy2)*(dx0-dx2) - (sy0-sy2)*(dx1-dx2)) / d;
+        const g  = sy2 - e*dx2 - f*dy2;
+        ctx.setTransform(a, e, b, f, c, g);
+        ctx.drawImage(img, 0, 0);
+        ctx.restore();
+      };
+
+      const dst = [[0,0],[dstW,0],[dstW,dstH],[0,dstH]] as [number,number][];
+      warpTri(dst[0], dst[1], dst[2], tl, tr, br);
+      warpTri(dst[0], dst[2], dst[3], tl, br, bl);
+
+      // Downscale to max 800px — matches backend resize_for_response
+      const maxDim = 800;
+      const scale = Math.min(1, maxDim / Math.max(dstW, dstH));
+      if (scale < 1) {
+        const c2 = document.createElement('canvas');
+        c2.width = Math.round(dstW * scale); c2.height = Math.round(dstH * scale);
+        c2.getContext('2d')!.drawImage(canvas, 0, 0, c2.width, c2.height);
+        resolve(c2.toDataURL('image/jpeg', 0.85));
+      } else {
+        resolve(canvas.toDataURL('image/jpeg', 0.85));
+      }
+    };
+    img.src = dataUrl;
+  });
+}
+
 // ─── Helper: average mass scores across multiple scans ───────────────────────
 
 /**
@@ -232,11 +298,17 @@ function DashboardContent() {
     e.target.value = "";
   };
 
-  const handleCropConfirm = (points: Point[]) => {
+  const handleCropConfirm = async (points: Point[]) => {
     setIsCropping(false);
     setLastCropPoints(points);
-    if (file) {
-      analyzeImage(file, points, [], [], [], [], true);
+    if (file && originalImage) {
+      // Warp the image client-side — instant, zero network calls.
+      // User can calibrate immediately; backend is only called once for YOLO.
+      const cropped = await applyClientCrop(originalImage, points);
+      setCroppedRawImage(cropped);
+      setCurrentDisplayImage(cropped);
+      resetCalibration();
+      setCalibrationStep("calibrating");
       scrollToAnalyzer();
     }
   };
@@ -250,20 +322,19 @@ function DashboardContent() {
     refP: Point[] = [],
     refK: Point[] = [],
     refFiller: Point[] = [],
-    enterCalibration = false,
+    replaceLast = false,
   ) => {
     setLoading(true);
     const formData = new FormData();
     formData.append("file", selectedFile);
+    formData.append("mode", "analyze");
 
     const cropPoints = points ?? lastCropPoints;
     if (cropPoints) formData.append("points", JSON.stringify(cropPoints));
-    if (refN.length > 0) formData.append("ref_n_points", JSON.stringify(refN));
-    if (refP.length > 0) formData.append("ref_p_points", JSON.stringify(refP));
-    if (refK.length > 0) formData.append("ref_k_points", JSON.stringify(refK));
+    if (refN.length > 0)      formData.append("ref_n_points",      JSON.stringify(refN));
+    if (refP.length > 0)      formData.append("ref_p_points",      JSON.stringify(refP));
+    if (refK.length > 0)      formData.append("ref_k_points",      JSON.stringify(refK));
     if (refFiller.length > 0) formData.append("ref_filler_points", JSON.stringify(refFiller));
-
-    formData.append("mode", enterCalibration ? "crop_only" : "analyze");
 
     try {
       const res = await fetch(API_URL, { method: "POST", body: formData });
@@ -279,47 +350,30 @@ function DashboardContent() {
       }
 
       const data = await res.json();
+      const procImg = `data:image/jpeg;base64,${data.image_b64}`;
+      const rawCrop = data.raw_cropped_b64
+        ? `data:image/jpeg;base64,${data.raw_cropped_b64}`
+        : null;
 
-      if (enterCalibration) {
-        const rawCrop = data.raw_cropped_b64
-          ? `data:image/jpeg;base64,${data.raw_cropped_b64}`
-          : null;
-        if (rawCrop) {
-          setCroppedRawImage(rawCrop);
-          setCurrentDisplayImage(rawCrop);
-          resetCalibration();
-          setCalibrationStep("calibrating");
-        }
-      } else {
-        const procImg = `data:image/jpeg;base64,${data.image_b64}`;
-        const rawCrop = data.raw_cropped_b64
-          ? `data:image/jpeg;base64,${data.raw_cropped_b64}`
-          : null;
+      setProcessedImage(procImg);
+      // Replace client-side preview with the authoritative server-side crop
+      if (rawCrop) setCroppedRawImage(rawCrop);
+      setCurrentDisplayImage(procImg);
 
-        setProcessedImage(procImg);
-        if (rawCrop) setCroppedRawImage(rawCrop);
-        setCurrentDisplayImage(procImg);
-
-        if (data.areas) {
-          // Use functional update to get the latest scanResults in this closure
-          setScanResults(prev => {
-            const newResult: ScanResult = {
-              scanIndex: prev.length,
-              massScores: data.areas as MassScores,
-              previewImage: procImg,
-            };
-            const updated = [...prev, newResult];
-
-            // Compute and apply the running average immediately
-            const averaged = averageMassScores(updated);
-            setMassScores(averaged);
-
-            if (updated.length >= REQUIRED_SCANS) {
-              setScanningComplete(true);
-            }
-            return updated;
-          });
-        }
+      if (data.areas) {
+        setScanResults(prev => {
+          // replaceLast=true when recalibrating — overwrite the slot, not add a new scan
+          const base = replaceLast && prev.length > 0 ? prev.slice(0, -1) : prev;
+          const newResult: ScanResult = {
+            scanIndex: base.length,
+            massScores: data.areas as MassScores,
+            previewImage: procImg,
+          };
+          const updated = [...base, newResult];
+          setMassScores(averageMassScores(updated));
+          if (updated.length >= REQUIRED_SCANS) setScanningComplete(true);
+          return updated;
+        });
       }
 
       setBackendStatus("ready");
@@ -351,7 +405,9 @@ function DashboardContent() {
     const totalPoints = refNPoints.length + refPPoints.length + refKPoints.length + refFillerPoints.length;
     if (!file || totalPoints < 1) return;
     setCalibrationStep("done");
-    analyzeImage(file, lastCropPoints, refNPoints, refPPoints, refKPoints, refFillerPoints);
+    // processedImage !== null means a scan was already counted for this image;
+    // replace that slot instead of adding a new scan entry.
+    analyzeImage(file, lastCropPoints, refNPoints, refPPoints, refKPoints, refFillerPoints, processedImage !== null);
   };
 
   const handleRecalibrate = () => {
