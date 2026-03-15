@@ -22,47 +22,6 @@ const HEALTH_URL = `${BASE_URL}/health`;
 type Point = { x: number; y: number };
 type BackendStatus = "unknown" | "warming" | "ready" | "error";
 
-// แทรกฟังก์ชันนี้ไว้ด้านบนสุด (ใต้บรรทัด import หรือก่อนเริ่ม function DashboardContent)
-/**
- * Resizes an image file on the client-side using HTML5 Canvas.
- * @param {File} file - Original image file.
- * @param {number} maxWidth - Maximum width allowed.
- * @returns {Promise<File>} Resized file.
- */
-const resizeImageClientSide = (file: File, maxWidth: number = 1024): Promise<File> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.readAsDataURL(file);
-    reader.onload = (event) => {
-      const img = new Image();
-      img.src = event.target?.result as string;
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        let newWidth = img.width;
-        let newHeight = img.height;
-
-        if (img.width > maxWidth) {
-          newWidth = maxWidth;
-          newHeight = Math.round((img.height * maxWidth) / img.width);
-        }
-
-        canvas.width = newWidth;
-        canvas.height = newHeight;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return reject(new Error("Canvas failed"));
-
-        ctx.drawImage(img, 0, 0, newWidth, newHeight);
-        canvas.toBlob((blob) => {
-          if (blob) resolve(new File([blob], file.name, { type: 'image/jpeg' }));
-          else reject(new Error("Blob failed"));
-        }, 'image/jpeg', 0.8);
-      };
-      img.onerror = reject;
-    };
-    reader.onerror = reject;
-  });
-};
-
 // ─── DashboardContent ─────────────────────────────────────────────────────────
 
 function DashboardContent() {
@@ -95,7 +54,6 @@ function DashboardContent() {
   const [refFillerPoints, setRefFillerPoints] = useState<Point[]>([]);
 
   // ── Backend health polling ──────────────────────────────────────────────────
-  // HF Spaces free tier sleeps after inactivity and returns 503 while waking up.
 
   useEffect(() => {
     let cancelled = false;
@@ -132,7 +90,6 @@ function DashboardContent() {
   }, [searchParams]);
 
   // ── Derived weights & chart data ───────────────────────────────────────────
-  // Memoized so they don't re-compute on unrelated state changes.
 
   const { finalWeights, pieChartData } = useMemo(() => {
     const total = Object.values(massScores).reduce((a, b) => a + b, 0);
@@ -169,8 +126,6 @@ function DashboardContent() {
       .catch(() => setBackendStatus("error"));
   }, []);
 
-  // When N/P/K targets change, auto-compute Filler so the total stays at 100%.
-  // When Filler is edited directly, accept it as a manual override.
   const handleTargetChange = useCallback((key: string, value: number) => {
     const newVal = isNaN(value) ? 0 : value;
     setTargets(prev => {
@@ -190,45 +145,44 @@ function DashboardContent() {
   };
 
   // ── File upload ────────────────────────────────────────────────────────────
+  //
+  // FIX: Removed client-side resizeImageClientSide() that used to resize the
+  // image to 1024px before sending. The backend already handles resizing via
+  // imgsz=1024 inside YOLO's predict(). Resizing twice caused:
+  //   1. The image to be compressed with JPEG artifacts twice (quality loss).
+  //   2. The pixel coordinates of YOLO masks to be based on a pre-shrunk image,
+  //      making area measurements slightly off.
+  // Now the original file is sent directly. The browser FileReader still reads
+  // it as a data URL for the preview, but the File object sent to the backend
+  // is the original unmodified file.
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedOriginalFile = e.target.files?.[0];
-    if (!selectedOriginalFile) return;
+    const selectedFile = e.target.files?.[0];
+    if (!selectedFile) return;
 
-    try {
-      // ทำการย่อขนาดภาพก่อนทำงานอื่น
-      const selectedFile = await resizeImageClientSide(selectedOriginalFile, 1024);
+    setFile(selectedFile);
+    setProcessedImage(null);
+    setCroppedRawImage(null);
+    setCurrentDisplayImage(null);
+    setLastCropPoints(null);
+    setCalibrationStep("idle");
+    resetCalibration();
 
-      setFile(selectedFile);
-      setProcessedImage(null);
-      setCroppedRawImage(null);
-      setCurrentDisplayImage(null);
-      setLastCropPoints(null);
-      setCalibrationStep("idle");
-      resetCalibration();
-
-      const reader = new FileReader();
-      reader.onload = (ev) => {
-        const imgUrl = ev.target?.result as string | undefined;
-        if (!imgUrl) return;
-        setOriginalImage(imgUrl);
-        setIsCropping(true); // เปิดหน้าต่างลากมุมทันที
-      };
-      // อ่านไฟล์ที่ถูกย่อขนาดแล้ว
-      reader.readAsDataURL(selectedFile);
-      e.target.value = "";
-    } catch (error) {
-      console.error("Error resizing image:", error);
-      alert("Image processing failed.");
-    }
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const imgUrl = ev.target?.result as string | undefined;
+      if (!imgUrl) return;
+      setOriginalImage(imgUrl);
+      setIsCropping(true);
+    };
+    reader.readAsDataURL(selectedFile);
+    e.target.value = "";
   };
 
   const handleCropConfirm = (points: Point[]) => {
     setIsCropping(false);
     setLastCropPoints(points);
     if (file) {
-      // Pass enterCalibration=true so the user is forced to calibrate
-      // before any annotated result is displayed.
       analyzeImage(file, points, [], [], true);
       scrollToAnalyzer();
     }
@@ -236,15 +190,6 @@ function DashboardContent() {
 
   // ── Core analysis call ─────────────────────────────────────────────────────
 
-  /**
-   * Triggers the backend analysis or image cropping process.
-   * Handles both 'crop_only' early exits and full YOLO inference responses.
-   * * @param {File} selectedFile - The uploaded image file.
-   * @param {Point[] | null} points - Coordinates for the perspective transform (warping).
-   * @param {Point[]} refN - Selected LAB reference points for Nitrogen.
-   * @param {Point[]} refFiller - Selected LAB reference points for Filler.
-   * @param {boolean} enterCalibration - If true, requests only the cropped image from backend (bypasses YOLO).
-   */
   const analyzeImage = async (
     selectedFile: File,
     points: Point[] | null = null,
@@ -261,12 +206,7 @@ function DashboardContent() {
     if (refN.length > 0) formData.append("ref_n_points", JSON.stringify(refN));
     if (refFiller.length > 0) formData.append("ref_filler_points", JSON.stringify(refFiller));
 
-    // 1. กำหนด Mode การทำงานส่งไปให้ Backend
-    if (enterCalibration) {
-      formData.append("mode", "crop_only");
-    } else {
-      formData.append("mode", "analyze");
-    }
+    formData.append("mode", enterCalibration ? "crop_only" : "analyze");
 
     try {
       const res = await fetch(API_URL, { method: "POST", body: formData });
@@ -283,21 +223,18 @@ function DashboardContent() {
 
       const data = await res.json();
 
-      // 2. แยกการจัดการข้อมูลตอบกลับ (Response Handling) ตาม Mode
       if (enterCalibration) {
-        // กรณี Crop อย่างเดียว Backend จะส่งมาแค่ raw_cropped_b64
         const rawCrop = data.raw_cropped_b64
           ? `data:image/jpeg;base64,${data.raw_cropped_b64}`
           : null;
 
         if (rawCrop) {
           setCroppedRawImage(rawCrop);
-          setCurrentDisplayImage(rawCrop); // แสดงภาพดิบทันที
+          setCurrentDisplayImage(rawCrop);
           resetCalibration();
-          setCalibrationStep("calibrating"); // เปิดแถบเครื่องมือจิ้มสี
+          setCalibrationStep("calibrating");
         }
       } else {
-        // กรณี Analyze เต็มรูปแบบ Backend จะส่งมาครบทั้งภาพที่ประมวลผลแล้วและค่าสัดส่วน
         const procImg = `data:image/jpeg;base64,${data.image_b64}`;
         const rawCrop = data.raw_cropped_b64
           ? `data:image/jpeg;base64,${data.raw_cropped_b64}`
@@ -306,9 +243,9 @@ function DashboardContent() {
         setProcessedImage(procImg);
         if (rawCrop) setCroppedRawImage(rawCrop);
 
-        setCurrentDisplayImage(procImg); // แสดงภาพที่มี Mask สีต่างๆ
+        setCurrentDisplayImage(procImg);
         if (data.areas) {
-          setMassScores(data.areas); // อัปเดตตัวเลขเปอร์เซ็นต์
+          setMassScores(data.areas);
         }
       }
 
@@ -324,7 +261,6 @@ function DashboardContent() {
   // ── Calibration handlers ───────────────────────────────────────────────────
 
   const handleStartCalibration = () => {
-    // Switch to the raw (un-annotated) image so the user sees true pellet colours.
     if (croppedRawImage) setCurrentDisplayImage(croppedRawImage);
     resetCalibration();
     setCalibrationStep("calibrating");
@@ -343,7 +279,6 @@ function DashboardContent() {
   };
 
   const handleRecalibrate = () => {
-    // Re-enter picking mode without wiping existing points (user may want to add more).
     setActivePickMode("n");
     setCalibrationStep("calibrating");
     if (croppedRawImage) setCurrentDisplayImage(croppedRawImage);
@@ -365,7 +300,6 @@ function DashboardContent() {
       {/* ── Hero section ──────────────────────────────────────────────────── */}
       <section className="relative min-h-[90vh] flex flex-col items-center justify-center px-4 overflow-hidden py-20">
 
-        {/* Background gradient blobs */}
         <div className="absolute inset-0 w-full h-full pointer-events-none">
           <div className="absolute inset-0 bg-white" />
           <div className="absolute -top-[10%] -right-[10%] w-[70vw] h-[70vw] rounded-full bg-gradient-to-b from-cyan-100 via-blue-200 to-transparent opacity-70 blur-[80px]" />
@@ -375,7 +309,6 @@ function DashboardContent() {
 
         <div className="relative z-10 text-center max-w-5xl mx-auto space-y-10">
 
-          {/* Live indicator pill */}
           <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-white border border-blue-100 shadow-sm text-sm font-semibold text-blue-700 mb-4">
             <span className="flex h-2 w-2 relative">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-500 opacity-75" />
@@ -384,11 +317,10 @@ function DashboardContent() {
             AI-Powered Fertilizer Analysis 2.0
           </div>
 
-          {/* Backend status badge */}
           {backendStatus === "warming" && (
             <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-amber-50 border border-amber-200 text-amber-700 text-xs font-medium mb-2">
               <span className="animate-spin inline-block w-3 h-3 border-2 border-amber-400 border-t-transparent rounded-full" />
-              AI backend waking up… (may take ~30s)
+              AI backend waking up... (may take ~30s)
             </div>
           )}
           {backendStatus === "error" && (
@@ -396,12 +328,12 @@ function DashboardContent() {
               onClick={retryBackend}
               className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-red-50 border border-red-200 text-red-600 text-xs font-medium mb-2 cursor-pointer hover:bg-red-100 transition-colors"
             >
-              ⚠ Backend unreachable — click to retry
+              Backend unreachable - click to retry
             </div>
           )}
           {backendStatus === "ready" && (
             <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 text-xs font-medium mb-2">
-              ✓ Backend ready
+              Backend ready
             </div>
           )}
 
@@ -421,7 +353,7 @@ function DashboardContent() {
 
           <div className="pt-16 grid grid-cols-1 md:grid-cols-3 gap-6">
             <FeatureCard icon={<Zap className="w-6 h-6" />} title="Instant AI Analysis" desc="Detects N, P, K particles in milliseconds." />
-            <FeatureCard icon={<CheckCircle2 className="w-6 h-6 text-emerald-500" />} title="Physics Engine" desc="Calculates weight based on volume & density." />
+            <FeatureCard icon={<CheckCircle2 className="w-6 h-6 text-emerald-500" />} title="Physics Engine" desc="Calculates weight based on volume and density." />
             <FeatureCard icon={<CalcIcon className="w-6 h-6 text-purple-500" />} title="Reverse Recipe" desc="Reverse engineering your mix recipe." />
           </div>
         </div>
@@ -437,7 +369,6 @@ function DashboardContent() {
 
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
 
-            {/* Left column: controls */}
             <div className="lg:col-span-4 space-y-6">
               <ControlPanel
                 file={file}
@@ -450,7 +381,6 @@ function DashboardContent() {
               />
             </div>
 
-            {/* Right column: image preview + stat cards */}
             <div className="lg:col-span-8 space-y-6 flex flex-col">
               <ImagePreview
                 loading={loading}
