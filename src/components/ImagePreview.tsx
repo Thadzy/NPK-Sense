@@ -106,7 +106,7 @@ const RefDot = memo(function RefDot({
       </span>
       {showDelete && (
         <button
-          onClick={e => { e.stopPr opagation(); onDelete(); }}
+          onClick={e => { e.stopPropagation(); onDelete(); }}
           style={{ top: -5, right: -5 }}
           className="absolute z-30 pointer-events-auto w-3.5 h-3.5 rounded-full bg-white border border-slate-400 flex items-center justify-center text-[8px] font-black text-slate-600 leading-none cursor-pointer hover:bg-red-100 hover:border-red-400 hover:text-red-600 shadow"
           title="Remove point"
