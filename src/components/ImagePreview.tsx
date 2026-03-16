@@ -28,10 +28,11 @@ interface ImagePreviewProps {
   onStartCalibration?: () => void;
   onRunCalibration?:   () => void;
   onRecalibrate?:      () => void;
-  onUndoLastPoint?:    () => void;
-  onClearAllPoints?:   () => void;
-  onRemovePoint?:      (mode: ActivePickMode, index: number) => void;
-  autoRunLabel?:       string;
+  onUndoLastPoint?:      () => void;
+  onClearAllPoints?:     () => void;
+  onRemovePoint?:        (mode: ActivePickMode, index: number) => void;
+  onCancelCalibration?:  () => void;
+  autoRunLabel?:         string;
 }
 
 // ─── Style constants ──────────────────────────────────────────────────────────
@@ -140,6 +141,7 @@ export default function ImagePreview({
   onUndoLastPoint,
   onClearAllPoints,
   onRemovePoint,
+  onCancelCalibration,
   autoRunLabel,
 }: ImagePreviewProps) {
   const isCalibrating  = calibrationStep === "calibrating";
@@ -411,6 +413,17 @@ export default function ImagePreview({
             >
               Clear all
             </button>
+            {processedImage && onCancelCalibration && (
+              <button
+                onClick={onCancelCalibration}
+                className={[
+                  "text-[10px] px-2.5 py-1 rounded-full border transition-all select-none",
+                  "border-white/20 text-slate-400 hover:text-amber-400 hover:border-amber-400/40",
+                ].join(" ")}
+              >
+                Cancel
+              </button>
+            )}
             {autoRunLabel ? (
               <span className="hidden sm:flex items-center gap-1.5 text-[10px] text-purple-300 font-medium ml-1">
                 <span className="inline-block w-2.5 h-2.5 border border-purple-400 border-t-transparent rounded-full animate-spin" />

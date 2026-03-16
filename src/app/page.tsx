@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useMemo, useCallback, Suspense } from "react";
 import { Chart as ChartJS, ArcElement, Tooltip, Legend } from "chart.js";
 import { useSearchParams } from "next/navigation";
-import { CheckCircle2, Zap, Microscope, Calculator as CalcIcon, Camera, RotateCcw, CheckCheck } from "lucide-react";
+import { CheckCircle2, Zap, Microscope, Calculator as CalcIcon, Camera, RotateCcw, CheckCheck, Pencil } from "lucide-react";
 import ControlPanel from "@/components/ControlPanel";
 import ImagePreview, { CalibrationStep, ActivePickMode } from "@/components/ImagePreview";
 import StatCard from "@/components/StatCard";
@@ -28,9 +28,10 @@ type BackendStatus = "unknown" | "warming" | "ready" | "error";
 type MassScores = { N: number; P: number; K: number; Filler: number };
 
 interface ScanResult {
-  scanIndex: number;
-  massScores: MassScores;
-  previewImage: string;
+  scanIndex:      number;
+  massScores:     MassScores;
+  previewImage:   string;
+  croppedDataUrl: string;
 }
 
 // ─── Helper: average mass scores ─────────────────────────────────────────────
@@ -77,6 +78,9 @@ function DashboardContent() {
   const [scanResults, setScanResults] = useState<ScanResult[]>([]);
   const [massScores, setMassScores] = useState<MassScores>({ N: 0, P: 0, K: 0, Filler: 0 });
   const [scanningComplete, setScanningComplete] = useState(false);
+  const [editingScanIndex, setEditingScanIndex] = useState<number | null>(null);
+  const [lastCroppedDataUrl, setLastCroppedDataUrl] = useState<string | null>(null);
+  const [selectedModel, setSelectedModel] = useState<"v2" | "x">("v2");
 
   const [calibrationStep, setCalibrationStep] = useState<CalibrationStep>("idle");
   const [activePickMode, setActivePickMode] = useState<ActivePickMode>("n");
@@ -243,6 +247,7 @@ function DashboardContent() {
     formData.append("file", selectedFile);
     formData.append("mode", "crop_only");
     formData.append("points", JSON.stringify(points));
+    formData.append("model_name", selectedModel);
 
     try {
       const res = await fetch(API_URL, { method: "POST", body: formData });
@@ -260,6 +265,7 @@ function DashboardContent() {
 
       if (rawCrop) {
         setCroppedRawImage(rawCrop);
+        setLastCroppedDataUrl(rawCrop);
         setCurrentDisplayImage(rawCrop);
         resetCalibration();
         setCalibrationStep("calibrating");
@@ -293,10 +299,12 @@ function DashboardContent() {
     refK: Point[] = [],
     refFiller: Point[] = [],
     replaceLast = false,
+    editIndex: number | null = null,
   ) => {
     setLoading(true);
     const formData = new FormData();
     formData.append("mode", "analyze");
+    formData.append("model_name", selectedModel);
 
     // Use the cropped file (~150KB) if available, otherwise fall back to
     // the original file + points for the backend to crop server-side.
@@ -336,17 +344,29 @@ function DashboardContent() {
 
       if (data.areas) {
         setScanResults(prev => {
+          if (editIndex !== null) {
+            const updated = prev.map((r, i) =>
+              i === editIndex
+                ? { scanIndex: editIndex, massScores: data.areas as MassScores, previewImage: procImg, croppedDataUrl: croppedRawImage ?? "" }
+                : r
+            );
+            setMassScores(averageMassScores(updated));
+            if (updated.length >= REQUIRED_SCANS) setScanningComplete(true);
+            return updated;
+          }
           const base = replaceLast && prev.length > 0 ? prev.slice(0, -1) : prev;
           const newResult: ScanResult = {
-            scanIndex: base.length,
-            massScores: data.areas as MassScores,
-            previewImage: procImg,
+            scanIndex:      base.length,
+            massScores:     data.areas as MassScores,
+            previewImage:   procImg,
+            croppedDataUrl: croppedRawImage ?? "",
           };
           const updated = [...base, newResult];
           setMassScores(averageMassScores(updated));
           if (updated.length >= REQUIRED_SCANS) setScanningComplete(true);
           return updated;
         });
+        setEditingScanIndex(null);
       }
 
       setBackendStatus("ready");
@@ -378,7 +398,11 @@ function DashboardContent() {
     const totalPoints = refNPoints.length + refPPoints.length + refKPoints.length + refFillerPoints.length;
     if (!file || totalPoints < 1) return;
     setCalibrationStep("done");
-    analyzeImage(file, lastCropPoints, refNPoints, refPPoints, refKPoints, refFillerPoints, processedImage !== null);
+    if (editingScanIndex !== null) {
+      analyzeImage(file, lastCropPoints, refNPoints, refPPoints, refKPoints, refFillerPoints, false, editingScanIndex);
+    } else {
+      analyzeImage(file, lastCropPoints, refNPoints, refPPoints, refKPoints, refFillerPoints, processedImage !== null);
+    }
   };
 
   const handleRecalibrate = () => {
@@ -397,6 +421,30 @@ function DashboardContent() {
   const handleClearAllPoints = () => {
     setRefNPoints([]); setRefPPoints([]);
     setRefKPoints([]); setRefFillerPoints([]);
+  };
+
+  const handleEditScan = (idx: number) => {
+    const result = scanResults[idx];
+    if (!result) return;
+    const dataUrl = result.croppedDataUrl;
+    setCroppedRawImage(dataUrl);
+    setCurrentDisplayImage(dataUrl);
+    const b64 = dataUrl.split(",")[1];
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    setCroppedFile(new File([bytes], "cropped.jpg", { type: "image/jpeg" }));
+    resetCalibration();
+    setCalibrationStep("calibrating");
+    setEditingScanIndex(idx);
+    setProcessedImage(result.previewImage);
+  };
+
+  const handleCancelCalibration = () => {
+    setCalibrationStep("done");
+    if (processedImage) setCurrentDisplayImage(processedImage);
+    resetCalibration();
+    setEditingScanIndex(null);
   };
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -477,6 +525,43 @@ function DashboardContent() {
 
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
             <div className="lg:col-span-4 space-y-6">
+              {/* Model selector */}
+              <div className="bg-white border border-slate-200 rounded-2xl px-5 py-4 shadow-sm">
+                <p className="text-xs font-semibold text-slate-500 mb-2">AI Model</p>
+                <div className="flex rounded-xl overflow-hidden border border-slate-200">
+                  <button
+                    onClick={() => setSelectedModel("v2")}
+                    className={`flex-1 flex flex-col items-center py-2 px-3 text-xs transition-all ${
+                      selectedModel === "v2"
+                        ? "bg-blue-600 text-white"
+                        : "bg-slate-100 text-slate-500 hover:bg-slate-200"
+                    }`}
+                  >
+                    <span className="font-bold">Standard</span>
+                    <span className={`text-[10px] ${selectedModel === "v2" ? "text-blue-200" : "text-slate-400"}`}>Faster · ~30s</span>
+                  </button>
+                  <button
+                    onClick={() => setSelectedModel("x")}
+                    className={`flex-1 flex flex-col items-center py-2 px-3 text-xs transition-all ${
+                      selectedModel === "x"
+                        ? "bg-purple-600 text-white"
+                        : "bg-slate-100 text-slate-500 hover:bg-slate-200"
+                    }`}
+                  >
+                    <span className="font-bold">Advanced</span>
+                    <span className={`text-[10px] ${selectedModel === "x" ? "text-purple-200" : "text-slate-400"}`}>More accurate · ~60s</span>
+                  </button>
+                </div>
+                <p className="text-[10px] text-slate-400 mt-1.5">
+                  {selectedModel === "v2"
+                    ? "YOLO11m — balanced speed and accuracy"
+                    : "YOLO11x — largest model, best for complex formulas"}
+                </p>
+                {scanResults.length > 0 && (
+                  <p className="text-[10px] text-amber-600 mt-1">Changing model will affect consistency between scans</p>
+                )}
+              </div>
+
               <ControlPanel
                 file={file}
                 totalWeight={totalWeight}
@@ -526,6 +611,7 @@ function DashboardContent() {
                 onRecalibrate={handleRecalibrate}
                 onUndoLastPoint={handleUndoLastPoint}
                 onClearAllPoints={handleClearAllPoints}
+                onCancelCalibration={handleCancelCalibration}
               />
 
               {calibrationStep === "done" && !scanningComplete && (
@@ -561,7 +647,13 @@ function DashboardContent() {
               </div>
 
               {scanResults.length > 0 && (
-                <ScanBreakdownTable scanResults={scanResults} massScores={massScores} />
+                <ScanBreakdownTable
+                  scanResults={scanResults}
+                  massScores={massScores}
+                  scanningComplete={scanningComplete}
+                  loading={loading}
+                  onEditScan={handleEditScan}
+                />
               )}
             </div>
           </div>
@@ -633,11 +725,14 @@ function ScanProgressBar({ scanResults, requiredScans, scanningComplete, loading
 // ─── ScanBreakdownTable ───────────────────────────────────────────────────────
 
 interface ScanBreakdownTableProps {
-  scanResults: ScanResult[];
-  massScores: MassScores;
+  scanResults:     ScanResult[];
+  massScores:      MassScores;
+  scanningComplete?: boolean;
+  loading?:          boolean;
+  onEditScan?:       (idx: number) => void;
 }
 
-function ScanBreakdownTable({ scanResults, massScores }: ScanBreakdownTableProps) {
+function ScanBreakdownTable({ scanResults, massScores, scanningComplete, loading, onEditScan }: ScanBreakdownTableProps) {
   const toPercent = (scores: MassScores) => {
     const total = scores.N + scores.P + scores.K + scores.Filler;
     if (total === 0) return { N: 0, P: 0, K: 0, Filler: 0 };
@@ -672,7 +767,20 @@ function ScanBreakdownTable({ scanResults, massScores }: ScanBreakdownTableProps
               const pct = toPercent(r.massScores);
               return (
                 <tr key={idx} className="border-b border-slate-50 hover:bg-slate-50 transition-colors">
-                  <td className="px-5 py-2.5 text-slate-600 font-medium">Scan {idx + 1}</td>
+                  <td className="px-5 py-2.5 text-slate-600 font-medium">
+                    <div className="flex items-center gap-1.5">
+                      Scan {idx + 1}
+                      {!scanningComplete && !loading && onEditScan && (
+                        <button
+                          onClick={() => onEditScan(idx)}
+                          className="p-1 rounded-lg text-slate-300 hover:text-blue-600 hover:bg-blue-50 transition-colors"
+                          title="Re-do this scan"
+                        >
+                          <Pencil size={11} />
+                        </button>
+                      )}
+                    </div>
+                  </td>
                   <td className="px-4 py-2.5 text-right text-slate-600">{pct.N.toFixed(1)}</td>
                   <td className="px-4 py-2.5 text-right text-emerald-600">{pct.P.toFixed(1)}</td>
                   <td className="px-4 py-2.5 text-right text-rose-500">{pct.K.toFixed(1)}</td>
